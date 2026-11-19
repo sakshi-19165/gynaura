@@ -49,3 +49,10 @@ GynAura bridges the continuity gap between clinic visits by pairing a structured
 | **Database** | MongoDB Atlas |
 | **Authentication** | Google OAuth & OTP-based authentication |
 | **Mobile Companion** | Flutter (shared REST API & design system) |
+
+---
+
+## License
+
+**Proprietary — All Rights Reserved (Non-Redistributable).** See [LICENSE](LICENSE) for details.
+
