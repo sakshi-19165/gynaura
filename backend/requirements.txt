@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+pydantic
+httpx
+pymongo[srv]
+python-dotenv
