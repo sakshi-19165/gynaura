@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -28,20 +30,20 @@ from pydantic import BaseModel, Field
 
 # Threading locks
 DATA_LOCK = threading.RLock()
-OTP_LOCK = threading.Lock()
 
 # Configuration
 MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "gynaura")
-ADMIN_KEY = os.getenv("ADMIN_KEY", "gyncare-admin-2026")
+ADMIN_KEY = os.getenv("ADMIN_KEY", "").strip()
 ADMIN_EMAILS = [e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()]
 DATA_FILE = Path(__file__).with_name("data.json")
 
-# In-memory OTP storage & rate limiting
-# otp_store: {(role, local_phone): {"code": otp_str, "expires_at": float, "attempts": int}}
-otp_store: Dict[Tuple[str, str], Dict[str, Any]] = {}
-# otp_rate_limit: {local_phone: [timestamp1, timestamp2, ...]}
-otp_rate_limit: Dict[str, List[float]] = {}
+
+def sanitize_user(user: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Strip password_hash and internal secrets before returning a user/doctor record."""
+    if not isinstance(user, dict):
+        return {}
+    return {k: v for k, v in user.items() if k != "password_hash"}
 
 # MongoDB Client state
 _mongo_client: Optional[Any] = None
@@ -81,12 +83,39 @@ def is_mongo_active() -> bool:
     return db is not None and _mongo_connected
 
 
-def is_twilio_configured() -> bool:
-    return bool(
-        os.getenv("TWILIO_ACCOUNT_SID")
-        and os.getenv("TWILIO_AUTH_TOKEN")
-        and os.getenv("TWILIO_FROM")
-    )
+def validate_strong_password(pw: str) -> None:
+    """Enforce strong password rules (min 8 chars, upper, lower, digit, special)."""
+    if (
+        not isinstance(pw, str)
+        or len(pw) < 8
+        or not re.search(r"[A-Z]", pw)
+        or not re.search(r"[a-z]", pw)
+        or not re.search(r"[0-9]", pw)
+        or not re.search(r"[^A-Za-z0-9]", pw)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 8 characters and include uppercase, lowercase, number, and special character.",
+        )
+
+
+def hash_password(pw: str) -> str:
+    """Hash a password with PBKDF2-HMAC-SHA256 and a random 16-byte hex salt."""
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 100_000).hex()
+    return f"{salt}${digest}"
+
+
+def verify_password(pw: str, stored: str) -> bool:
+    """Verify a plaintext password against a stored salt$digest hash."""
+    if not pw or not stored or "$" not in stored:
+        return False
+    try:
+        salt, expected_digest = stored.split("$", 1)
+        digest = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 100_000).hex()
+        return hmac.compare_digest(digest, expected_digest)
+    except Exception:
+        return False
 
 
 # App initialization
@@ -110,205 +139,23 @@ async def add_security_headers(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin-allow-popups"
     return response
 
 
-# Data Seed
+# Data Seed (Clean Empty State)
 def get_default_data() -> Dict[str, Any]:
-    doctors = {
-        "d-sarah": {
-            "id": "d-sarah",
-            "name": "Dr. Sarah Jenkins, MD, FACOG",
-            "phone": "9999900000",
-            "email": "",
-            "specialty": "Obstetrics & High-Risk Gynecology",
-            "clinics": ["Vijay Nagar, Indore", "Super Corridor, Indore"],
-            "nmc_reg": "MP-18492",
-            "status": "active",
-            "experience": "15+ years",
-        }
-    }
-
-    patients = {
-        "p-priya": {
-            "id": "p-priya",
-            "doctor_id": "d-sarah",
-            "name": "Priya Sharma",
-            "phone": "9876543210",
-            "email": "priya.sharma@gmail.com",
-            "age": 28,
-            "tag": "Antenatal",
-            "high_priority": False,
-            "summary": "Week 24 · Trimester II · Low Risk",
-            "adherence": 94,
-            "cycle": {"last_period": "2026-11-01", "cycle_length": 28},
-            "care_plans": [
-                {
-                    "id": "cp-1",
-                    "title": "75g Oral Glucose Tolerance Test (GTT)",
-                    "category": "Lab",
-                    "frequency": "Once this week",
-                    "notes": "Fasting sample at Vijay Nagar lab",
-                    "assigned_by": "Dr. Sarah Jenkins",
-                    "created_at": "2026-11-12",
-                },
-                {
-                    "id": "cp-2",
-                    "title": "Folic Acid 5mg + Iron",
-                    "category": "Medication",
-                    "frequency": "Daily after breakfast",
-                    "notes": "Continue through Trimester II",
-                    "assigned_by": "Dr. Sarah Jenkins",
-                    "created_at": "2026-11-10",
-                },
-            ],
-            "reminders": [
-                {"id": "rem-1", "name": "Folic Acid 5mg", "time": "9:00 AM · After breakfast", "done": True},
-                {"id": "rem-2", "name": "Iron + Vitamin C", "time": "2:00 PM · After lunch", "done": False},
-                {"id": "rem-3", "name": "Gynec Follow-Up · Vijay Nagar", "time": "Tue 10:30 AM", "done": False},
-            ],
-            "reports": [
-                {
-                    "id": "rep-1",
-                    "title": "Pelvic & TIFFA Anomaly Scan",
-                    "date": "2026-11-05",
-                    "status": "Normal",
-                    "summary": "Normal fetal growth parameters and amniotic fluid index.",
-                    "plain_explanation": "Your baby's anatomy and growth measurements are right on track for Week 24.",
-                },
-                {
-                    "id": "rep-2",
-                    "title": "Thyroid & CBC Panel",
-                    "date": "2026-10-28",
-                    "status": "Normal",
-                    "summary": "TSH 2.4 mIU/L · Hb 12.1 g/dL.",
-                    "plain_explanation": "Thyroid and hemoglobin levels are healthy and within target antenatal range.",
-                },
-            ],
-            "mood_logs": [{"id": "m-1", "mood": "Calm", "note": "Feeling rested after morning walk", "timestamp": "2026-11-19 08:30"}],
-            "symptom_logs": [{"id": "s-1", "flow": "None", "pain": 2, "symptoms": ["Mild fatigue"], "timestamp": "2026-11-19 08:35"}],
-            "pcos_habits": ["Protein-first breakfast", "30 min brisk walk"],
-            "pregnancy_checks": [],
-        },
-        "p-neha": {
-            "id": "p-neha",
-            "doctor_id": "d-sarah",
-            "name": "Neha Verma",
-            "phone": "9826011122",
-            "age": 23,
-            "tag": "PCOS",
-            "high_priority": False,
-            "summary": "PCOS Metabolic Protocol · Cycle Day 16",
-            "adherence": 86,
-            "cycle": {"last_period": "2026-11-03", "cycle_length": 34},
-            "care_plans": [
-                {"id": "cp-neha-1", "title": "Inositol Supplement", "category": "Medication", "frequency": "Twice daily", "notes": "With meals", "assigned_by": "Dr. Sarah Jenkins", "created_at": "2026-11-05"}
-            ],
-            "reminders": [
-                {"id": "rem-neha-1", "name": "Inositol Morning Dose", "time": "8:30 AM", "done": True}
-            ],
-            "reports": [
-                {"id": "rep-neha-1", "title": "Pelvic USG & Ovary Scan", "date": "2026-10-15", "status": "Normal", "summary": "PCO morphology noted.", "plain_explanation": "Consistent with mild PCOS pattern. Managed well with lifestyle and diet."}
-            ],
-            "mood_logs": [],
-            "symptom_logs": [],
-            "pcos_habits": ["Protein-first breakfast", "30 min brisk walk", "2.5L hydration"],
-            "pregnancy_checks": [],
-        },
-        "p-ritu": {
-            "id": "p-ritu",
-            "doctor_id": "d-sarah",
-            "name": "Ritu Jain",
-            "phone": "9826033344",
-            "age": 31,
-            "tag": "Fertility",
-            "high_priority": False,
-            "summary": "Preconception & Follicular Tracking",
-            "adherence": 91,
-            "cycle": {"last_period": "2026-11-07", "cycle_length": 28},
-            "care_plans": [],
-            "reminders": [],
-            "reports": [],
-            "mood_logs": [],
-            "symptom_logs": [],
-            "pcos_habits": ["8h sleep"],
-            "pregnancy_checks": [],
-        },
-        "p-ananya": {
-            "id": "p-ananya",
-            "doctor_id": "d-sarah",
-            "name": "Ananya Patel",
-            "phone": "9826055566",
-            "age": 30,
-            "tag": "High-Risk",
-            "high_priority": True,
-            "summary": "Week 29 · Gestational Diabetes Monitoring",
-            "adherence": 78,
-            "cycle": {"last_period": "2026-04-29", "cycle_length": 28},
-            "care_plans": [],
-            "reminders": [],
-            "reports": [
-                {"id": "rep-ana-1", "title": "Oral Glucose Tolerance Test", "date": "2026-11-15", "status": "Needs Review", "summary": "Elevated post-prandial blood sugar 165 mg/dL.", "plain_explanation": "Requires dietary adjustment and close blood glucose monitoring."}
-            ],
-            "mood_logs": [],
-            "symptom_logs": [],
-            "pcos_habits": [],
-            "pregnancy_checks": [],
-        },
-    }
-
-    appointments = [
-        {
-            "id": "apt-1",
-            "doctor_id": "d-sarah",
-            "patient_id": "p-priya",
-            "name": "Priya Sharma",
-            "phone": "9876543210",
-            "service": "Antenatal Trimester II Checkup",
-            "date": "2026-11-22 10:30",
-            "mode": "In-Clinic",
-            "status": "Confirmed",
-            "notes": "Bring GTT lab report",
-        },
-        {
-            "id": "apt-2",
-            "doctor_id": "d-sarah",
-            "patient_id": "p-neha",
-            "name": "Neha Verma",
-            "phone": "9826011122",
-            "service": "PCOS Consultation & Diet Review",
-            "date": "2026-11-22 11:30",
-            "mode": "In-Clinic",
-            "status": "Pending",
-            "notes": "First visit for metabolic protocol",
-        },
-        {
-            "id": "apt-3",
-            "doctor_id": "d-sarah",
-            "patient_id": "p-ananya",
-            "name": "Ananya Patel",
-            "phone": "9826055566",
-            "service": "High-Risk Gestational Diabetes Review",
-            "date": "2026-11-23 12:00",
-            "mode": "Video",
-            "status": "Confirmed",
-            "notes": "Review recent GTT values",
-        },
-    ]
-
-    clinics = []
-
     return {
-        "doctors": doctors,
-        "patients": patients,
-        "appointments": appointments,
-        "clinics": clinics,
+        "doctors": {},
+        "patients": {},
+        "appointments": [],
+        "clinics": [],
         "sessions": {},
     }
 
 
 def _migrate_data(data: Dict[str, Any]) -> bool:
-    """Auto-migrate legacy single-doctor schema to multi-doctor schema."""
+    """Ensure required top-level collections exist without seeding fake records."""
     changed = False
     if "sessions" not in data or not isinstance(data.get("sessions"), dict):
         data["sessions"] = {}
@@ -316,22 +163,16 @@ def _migrate_data(data: Dict[str, Any]) -> bool:
     if "clinics" not in data or not isinstance(data.get("clinics"), list):
         data["clinics"] = []
         changed = True
-
     if "doctors" not in data or not isinstance(data.get("doctors"), dict):
-        if "doctor" in data and isinstance(data["doctor"], dict):
-            legacy_doc = data.pop("doctor")
-            doc_id = legacy_doc.get("id", "d-sarah")
-            data["doctors"] = {
-                doc_id: {
-                    "status": "active",
-                    "nmc_reg": "MP-18492",
-                    **legacy_doc,
-                }
-            }
-        else:
-            data["doctors"] = get_default_data()["doctors"]
+        data["doctors"] = {}
         changed = True
-    elif "doctor" in data:
+    if "patients" not in data or not isinstance(data.get("patients"), dict):
+        data["patients"] = {}
+        changed = True
+    if "appointments" not in data or not isinstance(data.get("appointments"), list):
+        data["appointments"] = []
+        changed = True
+    if "doctor" in data:
         data.pop("doctor", None)
         changed = True
 
@@ -341,18 +182,8 @@ def _migrate_data(data: Dict[str, Any]) -> bool:
                 doc["status"] = "active"
                 changed = True
             if "nmc_reg" not in doc:
-                doc["nmc_reg"] = "MP-18492" if doc.get("id") == "d-sarah" else ""
+                doc["nmc_reg"] = ""
                 changed = True
-
-    for p in data.get("patients", {}).values():
-        if isinstance(p, dict) and not p.get("doctor_id"):
-            p["doctor_id"] = "d-sarah"
-            changed = True
-
-    for a in data.get("appointments", []):
-        if isinstance(a, dict) and not a.get("doctor_id"):
-            a["doctor_id"] = "d-sarah"
-            changed = True
 
     for c in data.get("clinics", []):
         if isinstance(c, dict):
@@ -490,11 +321,11 @@ def find_patient_by_phone_or_id(patients: dict, patient_id: Optional[str] = None
         return patients[patient_id]
     if phone:
         norm_phone = normalize_phone_safe(phone)
-        for p in patients.values():
-            if normalize_phone_safe(p.get("phone")) == norm_phone:
-                return p
-    # Default fallback
-    return patients.get("p-priya")
+        if norm_phone:
+            for p in patients.values():
+                if normalize_phone_safe(p.get("phone")) == norm_phone:
+                    return p
+    return None
 
 
 def create_patient_record(
@@ -503,17 +334,17 @@ def create_patient_record(
     phone: str,
     age: int = 26,
     tag: str = "General",
-    summary: str = "New Indore patient",
+    summary: str = "",
     high_priority: bool = False,
     email: str = "",
     picture: str = "",
-    doctor_id: str = "d-sarah",
+    doctor_id: str = "",
 ) -> dict:
     norm_phone = normalize_phone_safe(phone) if phone else ""
     pid = f"p-{secrets.token_hex(4)}"
     new_patient = {
         "id": pid,
-        "doctor_id": doctor_id or "d-sarah",
+        "doctor_id": doctor_id or "",
         "name": name,
         "phone": norm_phone,
         "email": email,
@@ -522,8 +353,8 @@ def create_patient_record(
         "tag": tag,
         "high_priority": high_priority,
         "summary": summary,
-        "adherence": 100,
-        "cycle": {"last_period": datetime.now().strftime("%Y-%m-%d"), "cycle_length": 28},
+        "adherence": 0,
+        "cycle": {"last_period": "", "cycle_length": 0},
         "care_plans": [],
         "reminders": [],
         "reports": [],
@@ -579,34 +410,65 @@ def require_admin(
 
 
 def _resolve_doctor(authorization: Optional[str], data: Dict[str, Any]) -> Dict[str, Any]:
-    doctors = data.get("doctors", {})
+    token = extract_bearer_token(authorization)
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid Authorization header",
+        )
     res = _get_session_from_header(authorization, data)
-    if res:
-        _, session = res
-        if session.get("role") == "doctor":
-            doc = doctors.get(session.get("user_id"))
-            if doc:
-                return doc
-    if "d-sarah" in doctors:
-        return doctors["d-sarah"]
-    if doctors:
-        return next(iter(doctors.values()))
-    raise HTTPException(status_code=404, detail="Doctor not found")
+    if not res:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired doctor session",
+        )
+    _, session = res
+    if session.get("role") != "doctor":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Doctor privileges required",
+        )
+    doctors = data.get("doctors", {})
+    doc = doctors.get(session.get("user_id"))
+    if not doc or doc.get("status", "active") != "active":
+        raise HTTPException(status_code=403, detail="Doctor account not active")
+    return doc
+
+
+def require_patient(authorization: Optional[str], data: Dict[str, Any]) -> Dict[str, Any]:
+    token = extract_bearer_token(authorization)
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid Authorization header",
+        )
+    res = _get_session_from_header(authorization, data)
+    if not res:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired session",
+        )
+    _, session = res
+    if session.get("role") != "patient":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Patient session required",
+        )
+    patient = data.get("patients", {}).get(session.get("user_id"))
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    return patient
 
 
 # Pydantic models
-class OTPRequest(BaseModel):
-    phone: str
+class PasswordLoginRequest(BaseModel):
+    identifier: str
+    password: str
     role: str = "patient"
 
 
-class OTPVerify(BaseModel):
-    phone: str
-    otp: str
-    role: str = "patient"
-    name: Optional[str] = None
-    age: Optional[int] = None
-    tag: Optional[str] = "General"
+class SetPasswordRequest(BaseModel):
+    password: str
 
 
 class ProfileUpdate(BaseModel):
@@ -644,9 +506,11 @@ class AdminDoctorUpdate(BaseModel):
     nmc_reg: Optional[str] = None
 
 
-class PatientRegister(BaseModel):
+class RegisterRequest(BaseModel):
     name: str
     phone: str
+    password: str
+    email: str = ""
     age: int = 26
     tag: str = "General"
 
@@ -740,14 +604,12 @@ class ClinicOnboard(BaseModel):
 @app.get("/api/health")
 def health_check():
     mongo_active = is_mongo_active()
-    twilio_active = is_twilio_configured()
     google_oauth = bool(os.getenv("GOOGLE_CLIENT_ID"))
     return {
         "status": "ok",
         "service": "GynAura API",
         "storage": "mongodb" if mongo_active else "json-local",
         "mongo_connected": mongo_active,
-        "sms_mode": "twilio" if twilio_active else "demo",
         "google_oauth": google_oauth,
     }
 
@@ -758,7 +620,6 @@ def auth_config():
     return {
         "google_client_id": google_client_id,
         "google_enabled": bool(google_client_id),
-        "sms_mode": "twilio" if is_twilio_configured() else "demo",
     }
 
 
@@ -845,7 +706,7 @@ def google_auth(payload: GoogleAuthRequest):
         if picture:
             admin_user["picture"] = picture
         token = _issue_session(data, "admin", admin_user, "")
-        return {"ok": True, "token": token, "role": "admin", "user": admin_user}
+        return {"ok": True, "token": token, "role": "admin", "user": admin_user, "needs_password": False}
 
     if payload.role == "doctor":
         doctors = data.get("doctors", {})
@@ -859,24 +720,19 @@ def google_auth(payload: GoogleAuthRequest):
         ]
         if not matched_doc:
             if email in allowed_doc_emails:
-                sarah = doctors.get("d-sarah")
-                if sarah and (not sarah.get("email") or len(allowed_doc_emails) == 1):
-                    sarah["email"] = email
-                    matched_doc = sarah
-                else:
-                    doc_id = f"d-{secrets.token_hex(4)}"
-                    matched_doc = {
-                        "id": doc_id,
-                        "name": name,
-                        "phone": "",
-                        "email": email,
-                        "specialty": "Obstetrics & Gynecology",
-                        "clinics": ["Indore"],
-                        "nmc_reg": "",
-                        "status": "active",
-                        "experience": "",
-                    }
-                    doctors[doc_id] = matched_doc
+                doc_id = f"d-{secrets.token_hex(4)}"
+                matched_doc = {
+                    "id": doc_id,
+                    "name": name,
+                    "phone": "",
+                    "email": email,
+                    "specialty": "Obstetrics & Gynecology",
+                    "clinics": ["Indore"],
+                    "nmc_reg": "",
+                    "status": "active",
+                    "experience": "",
+                }
+                doctors[doc_id] = matched_doc
             else:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -891,8 +747,30 @@ def google_auth(payload: GoogleAuthRequest):
 
         if picture:
             matched_doc["picture"] = picture
+        has_password = bool(matched_doc.get("password_hash"))
+        if has_password:
+            save_data(data)
+            return {
+                "ok": True,
+                "role": payload.role,
+                "user": {
+                    "id": matched_doc.get("id"),
+                    "name": matched_doc.get("name"),
+                    "email": matched_doc.get("email"),
+                    "phone": matched_doc.get("phone", ""),
+                },
+                "needs_password": False,
+                "requires_password_verify": True,
+            }
         token = _issue_session(data, "doctor", matched_doc, matched_doc.get("phone", ""))
-        return {"ok": True, "token": token, "role": "doctor", "user": matched_doc}
+        return {
+            "ok": True,
+            "token": token,
+            "role": payload.role,
+            "user": sanitize_user(matched_doc),
+            "needs_password": True,
+            "requires_password_verify": False,
+        }
 
     # Patient flow
     patients = data["patients"]
@@ -902,38 +780,52 @@ def google_auth(payload: GoogleAuthRequest):
         if picture and not user.get("picture"):
             user["picture"] = picture
     else:
-        pid = f"p-{secrets.token_hex(4)}"
-        user = {
-            "id": pid,
-            "doctor_id": "d-sarah",
-            "name": name,
-            "email": email,
-            "picture": picture,
-            "phone": "",
-            "age": 26,
-            "tag": "General",
-            "high_priority": False,
-            "summary": "GynAura Member · Indore",
-            "adherence": 100,
-            "cycle": {"last_period": datetime.now().strftime("%Y-%m-%d"), "cycle_length": 28},
-            "care_plans": [],
-            "reminders": [],
-            "reports": [],
-            "mood_logs": [],
-            "symptom_logs": [],
-            "pcos_habits": [],
-            "pregnancy_checks": [],
+        user = create_patient_record(
+            patients,
+            name=name,
+            phone="",
+            age=26,
+            tag="General",
+            email=email,
+            picture=picture,
+        )
+
+    has_password = bool(user.get("password_hash"))
+    if has_password:
+        save_data(data)
+        return {
+            "ok": True,
+            "role": payload.role,
+            "user": {
+                "id": user.get("id"),
+                "name": user.get("name"),
+                "email": user.get("email"),
+                "phone": user.get("phone", ""),
+            },
+            "needs_password": False,
+            "requires_password_verify": True,
         }
-        patients[pid] = user
 
     token = _issue_session(data, "patient", user, user.get("phone", ""))
-    return {"ok": True, "token": token, "role": "patient", "user": user}
+    return {
+        "ok": True,
+        "token": token,
+        "role": payload.role,
+        "user": sanitize_user(user),
+        "needs_password": True,
+        "requires_password_verify": False,
+    }
 
 
 @app.post("/api/auth/admin-login")
 def admin_login(payload: AdminLoginRequest):
-    expected_key = os.getenv("ADMIN_KEY") or ADMIN_KEY
-    if payload.admin_key != expected_key:
+    expected_key = (os.getenv("ADMIN_KEY") or ADMIN_KEY).strip()
+    if not expected_key:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Temporary admin key has been revoked. Sign in with an authorized Admin Google account.",
+        )
+    if not hmac.compare_digest(payload.admin_key, expected_key):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid admin key",
@@ -946,66 +838,6 @@ def admin_login(payload: AdminLoginRequest):
         "token": token,
         "role": "admin",
         "user": {"id": "admin-1", "name": "GynAura Admin"},
-    }
-
-
-@app.post("/api/auth/request-otp")
-def request_otp(payload: OTPRequest):
-    local_phone, e164 = normalize_phone(payload.phone)
-    role = payload.role
-    now = time.time()
-
-    # Rate limiting: max 5 requests per 10 minutes
-    with OTP_LOCK:
-        history = otp_rate_limit.get(local_phone, [])
-        recent = [t for t in history if now - t < 600]
-        if len(recent) >= 5:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Too many OTP requests. Please wait a few minutes.",
-            )
-        recent.append(now)
-        otp_rate_limit[local_phone] = recent
-
-        otp = f"{secrets.randbelow(900000) + 100000}"
-        otp_store[(role, local_phone)] = {
-            "code": otp,
-            "expires_at": now + 300,
-            "attempts": 0,
-        }
-
-    twilio_configured = is_twilio_configured()
-    if twilio_configured:
-        twilio_sid = os.getenv("TWILIO_ACCOUNT_SID")
-        twilio_token = os.getenv("TWILIO_AUTH_TOKEN")
-        twilio_from = os.getenv("TWILIO_FROM")
-        try:
-            resp = httpx.post(
-                f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json",
-                auth=(twilio_sid, twilio_token),
-                data={
-                    "From": twilio_from,
-                    "To": e164,
-                    "Body": f"Your GynAura verification code is {otp}. It expires in 5 minutes.",
-                },
-                timeout=10.0,
-            )
-            if resp.status_code >= 400:
-                raise HTTPException(status_code=502, detail="Failed to send OTP SMS via Twilio")
-            return {"ok": True, "phone": local_phone, "e164": e164, "role": role, "sms_sent": True}
-        except HTTPException:
-            raise
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"Failed to send OTP SMS via Twilio: {exc}")
-
-    return {
-        "ok": True,
-        "phone": local_phone,
-        "e164": e164,
-        "role": role,
-        "sms_sent": False,
-        "demo_otp": otp,
-        "mode": "demo",
     }
 
 
@@ -1023,97 +855,77 @@ def _issue_session(data: Dict[str, Any], role: str, user: Dict[str, Any], phone:
     return token
 
 
-@app.post("/api/auth/verify-otp")
-def verify_otp(payload: OTPVerify):
-    local_phone, _ = normalize_phone(payload.phone)
-    otp = (payload.otp or "").strip()
-    role = payload.role
-    twilio_configured = is_twilio_configured()
+def _match_user_by_identifier(
+    users: Dict[str, Dict[str, Any]], identifier: str
+) -> Optional[Dict[str, Any]]:
+    ident = (identifier or "").strip()
+    if not ident:
+        return None
+    ident_lower = ident.lower()
+    ident_phone = "" if "@" in ident else normalize_phone_safe(ident)
+    for u in users.values():
+        u_email = (u.get("email") or "").strip().lower()
+        if u_email and u_email == ident_lower:
+            return u
+        u_phone = normalize_phone_safe(u.get("phone"))
+        if ident_phone and len(ident_phone) >= 10 and u_phone == ident_phone:
+            return u
+    return None
 
-    with OTP_LOCK:
-        key = (role, local_phone)
-        entry = otp_store.get(key)
-        if entry:
-            if entry.get("attempts", 0) >= 5:
-                otp_store.pop(key, None)
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail="Too many failed attempts. Request a new OTP.",
-                )
 
-            if time.time() > entry["expires_at"]:
-                otp_store.pop(key, None)
-                raise HTTPException(status_code=400, detail="OTP expired")
-
-            is_code_valid = (otp == entry["code"])
-            is_demo_bypass = (not twilio_configured and otp == "123456")
-
-            if not (is_code_valid or is_demo_bypass):
-                entry["attempts"] = entry.get("attempts", 0) + 1
-                if entry["attempts"] >= 5:
-                    otp_store.pop(key, None)
-                    raise HTTPException(
-                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                        detail="Too many failed attempts. Request a new OTP.",
-                    )
-                raise HTTPException(status_code=400, detail="Invalid OTP")
-
-            # Successfully verified
-            otp_store.pop(key, None)
-        else:
-            is_demo_bypass = (not twilio_configured and otp == "123456")
-            if not is_demo_bypass:
-                raise HTTPException(status_code=400, detail="Invalid OTP")
-
+@app.post("/api/auth/login")
+def password_login(payload: PasswordLoginRequest):
     data = load_data()
+    role = (payload.role or "patient").strip().lower()
+
     if role == "doctor":
-        doctors = data.get("doctors", {})
-        user = next(
-            (
-                d
-                for d in doctors.values()
-                if normalize_phone_safe(d.get("phone")) == local_phone
-            ),
-            None,
-        )
+        user = _match_user_by_identifier(data.get("doctors", {}), payload.identifier)
         if not user or user.get("status", "active") != "active":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Doctor account not enrolled or suspended. Contact GynAura Admin.",
             )
-    else:
-        patients = data["patients"]
-        existing = next((p for p in patients.values() if normalize_phone_safe(p.get("phone")) == local_phone), None)
-        if existing:
-            user = existing
-        elif payload.name:
-            user = create_patient_record(
-                patients,
-                name=payload.name,
-                phone=local_phone,
-                age=payload.age if payload.age is not None else 26,
-                tag=payload.tag or "General",
+    elif role == "patient":
+        user = _match_user_by_identifier(data.get("patients", {}), payload.identifier)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials",
             )
-        else:
-            user = find_patient_by_phone_or_id(patients, phone=local_phone)
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid role",
+        )
 
-    token = _issue_session(data, role, user, local_phone)
+    stored_hash = user.get("password_hash")
+    if not stored_hash or not verify_password(payload.password, stored_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+        )
+
+    token = _issue_session(data, role, user, user.get("phone", ""))
     return {
         "ok": True,
         "token": token,
         "role": role,
-        "user": user,
+        "user": sanitize_user(user),
     }
 
 
 @app.post("/api/auth/register")
-def register_patient(payload: PatientRegister):
+def register_patient(payload: RegisterRequest):
+    validate_strong_password(payload.password)
     local_phone, _ = normalize_phone(payload.phone)
+    email = (payload.email or "").strip().lower()
     data = load_data()
     patients = data["patients"]
     existing = next((p for p in patients.values() if normalize_phone_safe(p.get("phone")) == local_phone), None)
     if existing:
         raise HTTPException(status_code=400, detail="Phone number already registered")
+    if email and any((p.get("email") or "").strip().lower() == email for p in patients.values()):
+        raise HTTPException(status_code=400, detail="Email already registered")
 
     new_patient = create_patient_record(
         patients,
@@ -1121,14 +933,50 @@ def register_patient(payload: PatientRegister):
         phone=local_phone,
         age=payload.age,
         tag=payload.tag,
+        email=email,
     )
+    new_patient["password_hash"] = hash_password(payload.password)
     token = _issue_session(data, "patient", new_patient, local_phone)
     return {
         "ok": True,
         "token": token,
         "role": "patient",
-        "user": new_patient,
+        "user": sanitize_user(new_patient),
     }
+
+
+@app.post("/api/auth/set-password")
+def set_password(
+    payload: SetPasswordRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    token = extract_bearer_token(authorization)
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+
+    data = load_data()
+    res = _get_session_from_header(authorization, data)
+    if not res:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+
+    validate_strong_password(payload.password)
+
+    _, session = res
+    role = session.get("role")
+    user_id = session.get("user_id")
+    if role == "doctor":
+        user = data.get("doctors", {}).get(user_id)
+    elif role == "patient":
+        user = data.get("patients", {}).get(user_id)
+    else:
+        raise HTTPException(status_code=400, detail="Password cannot be set for this role")
+
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    user["password_hash"] = hash_password(payload.password)
+    save_data(data)
+    return {"ok": True, "user": sanitize_user(user)}
 
 
 @app.get("/api/auth/me")
@@ -1160,7 +1008,7 @@ def get_auth_me(authorization: Optional[str] = Header(default=None)):
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
 
-    return {"authenticated": True, "role": role, "user": user}
+    return {"authenticated": True, "role": role, "user": sanitize_user(user)}
 
 
 @app.patch("/api/auth/profile")
@@ -1198,7 +1046,7 @@ def update_auth_profile(
                     c.strip() for c in payload.clinics if isinstance(c, str) and c.strip()
                 ]
             _save_data_internal(data)
-            return {"ok": True, "role": "doctor", "user": doctor}
+            return {"ok": True, "role": "doctor", "user": sanitize_user(doctor)}
 
         if role == "patient":
             patient = data["patients"].get(session["user_id"])
@@ -1216,7 +1064,7 @@ def update_auth_profile(
             if payload.tag is not None and payload.tag.strip():
                 patient["tag"] = payload.tag.strip()
             _save_data_internal(data)
-            return {"ok": True, "role": "patient", "user": patient}
+            return {"ok": True, "role": "patient", "user": sanitize_user(patient)}
 
         raise HTTPException(status_code=401, detail="Invalid session role")
 
@@ -1233,27 +1081,22 @@ def logout(authorization: Optional[str] = Header(default=None)):
 
 
 @app.get("/api/patient/profile")
-def get_patient_profile(patient_id: Optional[str] = None, phone: Optional[str] = None):
+def get_patient_profile(
+    patient_id: Optional[str] = None,
+    phone: Optional[str] = None,
+    authorization: Optional[str] = Header(default=None),
+):
     data = load_data()
-    patients = data["patients"]
-    norm_phone = None
-    if phone:
-        try:
-            norm_phone, _ = normalize_phone(phone)
-        except Exception:
-            norm_phone = phone
-
-    patient = find_patient_by_phone_or_id(patients, patient_id=patient_id, phone=norm_phone)
-    if not patient:
-        raise HTTPException(status_code=404, detail="Patient not found")
+    patient = require_patient(authorization, data)
 
     p_id = patient["id"]
-    p_phone = patient["phone"]
+    p_norm_phone = normalize_phone_safe(patient.get("phone"))
 
-    # Filter appointments matching patient_id or normalized phone
+    # Filter appointments matching patient_id or non-empty normalized phone
     patient_appointments = [
         apt for apt in data["appointments"]
-        if apt.get("patient_id") == p_id or normalize_phone_safe(apt.get("phone")) == normalize_phone_safe(p_phone)
+        if apt.get("patient_id") == p_id
+        or (len(p_norm_phone) >= 10 and normalize_phone_safe(apt.get("phone")) == p_norm_phone)
     ]
 
     disclaimer = (
@@ -1262,19 +1105,19 @@ def get_patient_profile(patient_id: Optional[str] = None, phone: Optional[str] =
     )
 
     return {
-        **patient,
+        **sanitize_user(patient),
         "appointments": patient_appointments,
         "disclaimer": disclaimer,
     }
 
 
 @app.post("/api/patient/cycle")
-def update_cycle(payload: CycleUpdate):
+def update_cycle(
+    payload: CycleUpdate,
+    authorization: Optional[str] = Header(default=None),
+):
     data = load_data()
-    patients = data["patients"]
-    patient = find_patient_by_phone_or_id(patients, patient_id=payload.patient_id)
-    if not patient:
-        raise HTTPException(status_code=404, detail="Patient not found")
+    patient = require_patient(authorization, data)
 
     patient["cycle"] = {
         "last_period": payload.last_period,
@@ -1285,12 +1128,12 @@ def update_cycle(payload: CycleUpdate):
 
 
 @app.post("/api/patient/mood")
-def add_mood(payload: MoodLog):
+def add_mood(
+    payload: MoodLog,
+    authorization: Optional[str] = Header(default=None),
+):
     data = load_data()
-    patients = data["patients"]
-    patient = find_patient_by_phone_or_id(patients, patient_id=payload.patient_id)
-    if not patient:
-        raise HTTPException(status_code=404, detail="Patient not found")
+    patient = require_patient(authorization, data)
 
     new_mood = {
         "id": f"m-{datetime.now().strftime('%Y%m%d%H%M%S')}",
@@ -1304,12 +1147,12 @@ def add_mood(payload: MoodLog):
 
 
 @app.post("/api/patient/symptoms")
-def add_symptoms(payload: SymptomLog):
+def add_symptoms(
+    payload: SymptomLog,
+    authorization: Optional[str] = Header(default=None),
+):
     data = load_data()
-    patients = data["patients"]
-    patient = find_patient_by_phone_or_id(patients, patient_id=payload.patient_id)
-    if not patient:
-        raise HTTPException(status_code=404, detail="Patient not found")
+    patient = require_patient(authorization, data)
 
     new_sym = {
         "id": f"s-{datetime.now().strftime('%Y%m%d%H%M%S')}",
@@ -1324,12 +1167,12 @@ def add_symptoms(payload: SymptomLog):
 
 
 @app.post("/api/patient/reminders/toggle")
-def toggle_reminder(payload: ReminderToggle):
+def toggle_reminder(
+    payload: ReminderToggle,
+    authorization: Optional[str] = Header(default=None),
+):
     data = load_data()
-    patients = data["patients"]
-    patient = find_patient_by_phone_or_id(patients, patient_id=payload.patient_id)
-    if not patient:
-        raise HTTPException(status_code=404, detail="Patient not found")
+    patient = require_patient(authorization, data)
 
     for rem in patient["reminders"]:
         if rem["id"] == payload.reminder_id:
@@ -1341,12 +1184,12 @@ def toggle_reminder(payload: ReminderToggle):
 
 
 @app.post("/api/patient/reminders")
-def create_reminder(payload: ReminderCreate):
+def create_reminder(
+    payload: ReminderCreate,
+    authorization: Optional[str] = Header(default=None),
+):
     data = load_data()
-    patients = data["patients"]
-    patient = find_patient_by_phone_or_id(patients, patient_id=payload.patient_id)
-    if not patient:
-        raise HTTPException(status_code=404, detail="Patient not found")
+    patient = require_patient(authorization, data)
 
     new_rem = {
         "id": f"rem-{datetime.now().strftime('%Y%m%d%H%M%S')}",
@@ -1360,13 +1203,13 @@ def create_reminder(payload: ReminderCreate):
 
 
 @app.delete("/api/patient/reminders/{reminder_id}")
-def delete_patient_reminder(reminder_id: str, patient_id: str = "p-priya"):
+def delete_patient_reminder(
+    reminder_id: str,
+    patient_id: str = "",
+    authorization: Optional[str] = Header(default=None),
+):
     data = load_data()
-    patients = data["patients"]
-    if patient_id not in patients:
-        raise HTTPException(status_code=404, detail="Patient not found")
-
-    patient = patients[patient_id]
+    patient = require_patient(authorization, data)
     before = len(patient["reminders"])
     patient["reminders"] = [r for r in patient["reminders"] if r.get("id") != reminder_id]
     if len(patient["reminders"]) == before:
@@ -1377,12 +1220,12 @@ def delete_patient_reminder(reminder_id: str, patient_id: str = "p-priya"):
 
 
 @app.post("/api/patient/pcos")
-def update_pcos(payload: PCOSHabitsUpdate):
+def update_pcos(
+    payload: PCOSHabitsUpdate,
+    authorization: Optional[str] = Header(default=None),
+):
     data = load_data()
-    patients = data["patients"]
-    patient = find_patient_by_phone_or_id(patients, patient_id=payload.patient_id)
-    if not patient:
-        raise HTTPException(status_code=404, detail="Patient not found")
+    patient = require_patient(authorization, data)
 
     patient["pcos_habits"] = payload.habits
     save_data(data)
@@ -1390,16 +1233,16 @@ def update_pcos(payload: PCOSHabitsUpdate):
 
 
 @app.post("/api/patient/pregnancy-check")
-def pregnancy_check(payload: PregnancyCheck):
+def pregnancy_check(
+    payload: PregnancyCheck,
+    authorization: Optional[str] = Header(default=None),
+):
     data = load_data()
-    patients = data["patients"]
-    patient = find_patient_by_phone_or_id(patients, patient_id=payload.patient_id)
-    if not patient:
-        raise HTTPException(status_code=404, detail="Patient not found")
+    patient = require_patient(authorization, data)
 
     signs_count = len(payload.signs)
     if signs_count >= 3:
-        recommendation = "Multiple early signs reported. Consider taking a home urine pregnancy test or consulting Dr. Sarah Jenkins for a beta-hCG blood test."
+        recommendation = "Multiple early signs reported. Consider taking a home urine pregnancy test or consulting a gynecologist for a beta-hCG blood test."
     elif signs_count > 0:
         recommendation = "Some mild signs noted. Monitor symptoms for a few days and test if menstruation is delayed."
     else:
@@ -1435,21 +1278,21 @@ def doctor_dashboard(authorization: Optional[str] = Header(default=None)):
     all_appointments = data.get("appointments", [])
 
     patients = {
-        pid: p
+        pid: sanitize_user(p)
         for pid, p in all_patients.items()
-        if (p.get("doctor_id") or "d-sarah") == doctor_id
+        if p.get("doctor_id") == doctor_id
     }
     appointments = [
         a
         for a in all_appointments
-        if (a.get("doctor_id") or "d-sarah") == doctor_id
+        if a.get("doctor_id") == doctor_id
     ]
 
     total_patients = len(patients)
     upcoming_appointments = sum(1 for a in appointments if a.get("status") != "Completed")
     high_priority = sum(1 for p in patients.values() if p.get("high_priority", False))
 
-    adherences = [p.get("adherence", 85) for p in patients.values()]
+    adherences = [p.get("adherence", 0) for p in patients.values()]
     avg_adherence = int(sum(adherences) / len(adherences)) if adherences else 0
 
     kpis = {
@@ -1462,7 +1305,7 @@ def doctor_dashboard(authorization: Optional[str] = Header(default=None)):
     patient_summaries = list(patients.values())
 
     return {
-        "doctor": doctor,
+        "doctor": sanitize_user(doctor),
         "kpis": kpis,
         "patients": patient_summaries,
         "appointments": appointments,
@@ -1494,16 +1337,20 @@ def doctor_create_patient(
         doctor_id=doctor_id,
     )
     save_data(data)
-    return {"ok": True, "patient": new_patient}
+    return {"ok": True, "patient": sanitize_user(new_patient)}
 
 
 @app.get("/api/doctor/patients/{patient_id}")
-def get_doctor_patient_detail(patient_id: str):
+def get_doctor_patient_detail(
+    patient_id: str,
+    authorization: Optional[str] = Header(default=None),
+):
     data = load_data()
+    _resolve_doctor(authorization, data)
     patients = data["patients"]
     if patient_id not in patients:
         raise HTTPException(status_code=404, detail="Patient not found")
-    return patients[patient_id]
+    return sanitize_user(patients[patient_id])
 
 
 @app.post("/api/doctor/patients/{patient_id}/care-plan")
@@ -1548,8 +1395,13 @@ def doctor_add_care_plan(
 
 
 @app.delete("/api/doctor/patients/{patient_id}/care-plan/{plan_id}")
-def doctor_delete_care_plan(patient_id: str, plan_id: str):
+def doctor_delete_care_plan(
+    patient_id: str,
+    plan_id: str,
+    authorization: Optional[str] = Header(default=None),
+):
     data = load_data()
+    _resolve_doctor(authorization, data)
     patients = data["patients"]
     if patient_id not in patients:
         raise HTTPException(status_code=404, detail="Patient not found")
@@ -1565,8 +1417,13 @@ def doctor_delete_care_plan(patient_id: str, plan_id: str):
 
 
 @app.post("/api/doctor/patients/{patient_id}/reports")
-def doctor_add_report(patient_id: str, payload: ReportCreate):
+def doctor_add_report(
+    patient_id: str,
+    payload: ReportCreate,
+    authorization: Optional[str] = Header(default=None),
+):
     data = load_data()
+    _resolve_doctor(authorization, data)
     patients = data["patients"]
     if patient_id not in patients:
         raise HTTPException(status_code=404, detail="Patient not found")
@@ -1586,26 +1443,50 @@ def doctor_add_report(patient_id: str, payload: ReportCreate):
 
 
 @app.get("/api/appointments")
-def get_appointments():
+def get_appointments(authorization: Optional[str] = Header(default=None)):
     data = load_data()
-    return data["appointments"]
+    res = _get_session_from_header(authorization, data)
+    if not res:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    _, session = res
+    role = session.get("role")
+    if role == "admin":
+        return data["appointments"]
+    if role == "doctor":
+        doc_id = session.get("user_id")
+        return [a for a in data["appointments"] if a.get("doctor_id") == doc_id]
+    patient = data.get("patients", {}).get(session.get("user_id"))
+    if not patient:
+        return []
+    p_id = patient["id"]
+    p_norm_phone = normalize_phone_safe(patient.get("phone"))
+    return [
+        a for a in data["appointments"]
+        if a.get("patient_id") == p_id
+        or (len(p_norm_phone) >= 10 and normalize_phone_safe(a.get("phone")) == p_norm_phone)
+    ]
 
 
 @app.post("/api/appointments")
-def create_appointment(payload: AppointmentCreate):
+def create_appointment(
+    payload: AppointmentCreate,
+    authorization: Optional[str] = Header(default=None),
+):
     local_phone, _ = normalize_phone(payload.phone)
     data = load_data()
+    res = _get_session_from_header(authorization, data)
+    auth_patient_id = None
+    if res and res[1].get("role") == "patient":
+        auth_patient_id = res[1].get("user_id")
+
     target_patient = find_patient_by_phone_or_id(
-        data["patients"], patient_id=payload.patient_id, phone=local_phone
+        data["patients"], patient_id=auth_patient_id, phone=local_phone
     )
-    doctor_id = (
-        (target_patient.get("doctor_id") if target_patient else None)
-        or "d-sarah"
-    )
+    doctor_id = (target_patient.get("doctor_id") if target_patient else "") or ""
     new_apt = {
         "id": f"apt-{datetime.now().strftime('%Y%m%d%H%M%S')}",
         "doctor_id": doctor_id,
-        "patient_id": payload.patient_id or "p-priya",
+        "patient_id": (target_patient["id"] if target_patient else auth_patient_id or ""),
         "name": payload.name,
         "phone": local_phone,
         "service": payload.service,
@@ -1631,8 +1512,13 @@ def create_appointment(payload: AppointmentCreate):
 
 
 @app.patch("/api/doctor/appointments/{appt_id}")
-def update_appointment_status(appt_id: str, payload: AppointmentStatusUpdate):
+def update_appointment_status(
+    appt_id: str,
+    payload: AppointmentStatusUpdate,
+    authorization: Optional[str] = Header(default=None),
+):
     data = load_data()
+    _resolve_doctor(authorization, data)
     target_apt = None
     for apt in data["appointments"]:
         if apt["id"] == appt_id:
@@ -1693,7 +1579,7 @@ def admin_overview(authorization: Optional[str] = Header(default=None)):
             "total_patients": len(patients),
             "total_appointments": len(appointments),
         },
-        "doctors": list(doctors.values()),
+        "doctors": [sanitize_user(d) for d in doctors.values()],
         "clinic_requests": clinic_requests,
     }
 
@@ -1733,7 +1619,7 @@ def admin_create_doctor(
     }
     doctors[doc_id] = new_doc
     save_data(data)
-    return {"ok": True, "doctor": new_doc}
+    return {"ok": True, "doctor": sanitize_user(new_doc)}
 
 
 @app.patch("/api/admin/doctors/{doctor_id}")
@@ -1764,7 +1650,7 @@ def admin_update_doctor(
         doc["nmc_reg"] = payload.nmc_reg.strip()
 
     save_data(data)
-    return {"ok": True, "doctor": doc}
+    return {"ok": True, "doctor": sanitize_user(doc)}
 
 
 @app.post("/api/admin/clinic-requests/{req_id}/approve")
@@ -1820,7 +1706,7 @@ def admin_approve_clinic_request(
     save_data(data)
     return {
         "ok": True,
-        "doctor": new_doc,
+        "doctor": sanitize_user(new_doc),
         "clinic_requests": clinic_requests,
     }
 

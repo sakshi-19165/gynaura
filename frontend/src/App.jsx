@@ -25,7 +25,7 @@ function RouteHelper() {
   useEffect(() => {
     let io = null
     if (location.pathname === '/') {
-      const targets = document.querySelectorAll('.hero > div, .herocard, .center, .card, .doctor > div, .patient-shell')
+      const targets = document.querySelectorAll('.hero > div, .herocard, .center, .card:not(.vflow-step-card), .doctor > div, .patient-shell')
       targets.forEach((el, i) => {
         el.classList.add('reveal')
         el.style.transitionDelay = `${Math.min(i % 4, 3) * 65}ms`
@@ -67,25 +67,17 @@ function ProtectedRoute({ session, allowedRole, children }) {
   return children
 }
 
-export default function App() {
-  const [session, setSessionState] = useState(() => getSession())
-
-  useEffect(() => {
-    const syncAuth = () => setSessionState(getSession())
-    window.addEventListener('gynaura-auth', syncAuth)
-    window.addEventListener('storage', syncAuth)
-    return () => {
-      window.removeEventListener('gynaura-auth', syncAuth)
-      window.removeEventListener('storage', syncAuth)
-    }
-  }, [])
+function AppShellLayout({ session }) {
+  const location = useLocation()
+  const isWorkspace = ['/user', '/patient', '/doctor', '/admin', '/login'].some((p) =>
+    location.pathname.startsWith(p)
+  )
 
   return (
-    <BrowserRouter>
-      <RouteHelper />
+    <>
       <TopBar />
 
-      <main className="main-offset">
+      <main className={isWorkspace ? '' : 'main-offset'}>
         <Routes>
           <Route path="/" element={<LandingView />} />
           <Route
@@ -134,45 +126,68 @@ export default function App() {
         </Routes>
       </main>
 
-      <footer className="foot">
-        <div className="wrap footin">
-          <div>
-            <Link className="brand" to="/"><span className="logo">G</span>GynAura</Link>
-            <p className="muted">Connected women&apos;s healthcare for gynecologists and patients. Launching in Indore, MP.</p>
-          </div>
-          <div>
-            <h5>Platform</h5>
-            <Link to="/#overview">Overview</Link>
-            <Link to="/#specialties">Care Pillars</Link>
-            <Link to="/#for-doctors">For Gynecologists</Link>
-            {session?.token ? (
-              <Link to={getRoleHome(session.role)}>
-                {session.role === 'admin'
-                  ? 'Admin Portal'
-                  : session.role === 'doctor'
-                    ? 'Doctor Console'
-                    : 'My Health Hub'}
-              </Link>
-            ) : (
-              <Link to="/login">Sign In</Link>
-            )}
-          </div>
-          <div>
-            <h5>Patients</h5>
-            <Link to="/#book">Book Consultation</Link>
-            <Link to="/login">Patient Sign In</Link>
-            <Link to="/#specialties">Pregnancy &amp; PCOS</Link>
-            <Link to="/#book">Clinic Locations</Link>
-          </div>
-          <div>
-            <h5>Clinic · Indore</h5>
-            <span className="foot-txt">Vijay Nagar &amp; Super Corridor</span>
-            <span className="foot-txt">Mon–Sat · 9:00 AM – 8:00 PM</span>
-            <span className="foot-txt">24/7 Urgent Line Available</span>
-          </div>
+      <AppFooter />
+    </>
+  )
+}
+
+function AppFooter() {
+  const location = useLocation()
+  const isWorkspace = ['/user', '/patient', '/doctor', '/admin', '/login'].some((p) =>
+    location.pathname.startsWith(p)
+  )
+  if (isWorkspace) return null
+
+  return (
+    <footer className="foot">
+      <div className="wrap footin">
+        <div>
+          <Link className="brand" to="/"><span className="logo">G</span>GynAura</Link>
+          <p className="muted">Connected women&apos;s healthcare for gynecologists and patients. Launching in Indore, MP.</p>
         </div>
-        <div className="wrap copy">© {new Date().getFullYear()} GynAura. All rights reserved.</div>
-      </footer>
+        <div>
+          <h5>Platform</h5>
+          <Link to="/#overview">Overview</Link>
+          <Link to="/#specialties">Care Pillars</Link>
+          <Link to="/#how-it-works">How It Works</Link>
+          <Link to="/user">Try the App</Link>
+        </div>
+        <div>
+          <h5>Patients</h5>
+          <Link to="/#book">Book Consultation</Link>
+          <Link to="/user">Open Web App</Link>
+          <Link to="/#specialties">Pregnancy &amp; PCOS</Link>
+          <Link to="/#book">Clinic Locations</Link>
+        </div>
+        <div>
+          <h5>Clinic · Indore</h5>
+          <span className="foot-txt">Vijay Nagar &amp; Super Corridor</span>
+          <span className="foot-txt">Mon–Sat · 9:00 AM – 8:00 PM</span>
+          <span className="foot-txt">24/7 Urgent Line Available</span>
+        </div>
+      </div>
+      <div className="wrap copy">© {new Date().getFullYear()} GynAura. All rights reserved.</div>
+    </footer>
+  )
+}
+
+export default function App() {
+  const [session, setSessionState] = useState(() => getSession())
+
+  useEffect(() => {
+    const syncAuth = () => setSessionState(getSession())
+    window.addEventListener('gynaura-auth', syncAuth)
+    window.addEventListener('storage', syncAuth)
+    return () => {
+      window.removeEventListener('gynaura-auth', syncAuth)
+      window.removeEventListener('storage', syncAuth)
+    }
+  }, [])
+
+  return (
+    <BrowserRouter>
+      <RouteHelper />
+      <AppShellLayout session={session} />
     </BrowserRouter>
   )
 }

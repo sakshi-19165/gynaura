@@ -20,6 +20,15 @@ async function request(path, options = {}) {
   }
 
   if (!res.ok) {
+    if (
+      res.status === 401 &&
+      token &&
+      !path.startsWith('/auth/login') &&
+      !path.startsWith('/auth/admin-login') &&
+      !path.startsWith('/auth/google')
+    ) {
+      clearSession();
+    }
     const message = data?.detail || data?.message || `Request failed with status ${res.status}`;
     throw new Error(message);
   }

@@ -1,53 +1,37 @@
 import React, { useEffect, useState } from 'react';
-import { Link, NavLink, useLocation, useNavigate } from 'react-router-dom';
+import { Link, NavLink, useLocation } from 'react-router-dom';
 import { Icon, I } from './Icons.jsx';
-import { apiPost, clearSession, getSession } from '../api.js';
 
 export function TopBar() {
   const [mobileOpen, setMobileOpen] = useState(false);
-  const [session, setSessionState] = useState(() => getSession());
+  const [theme, setTheme] = useState(() => {
+    const saved = typeof window !== 'undefined' ? localStorage.getItem('gynaura_theme') : null;
+    const initial = saved === 'light' ? 'light' : 'dark';
+    if (typeof document !== 'undefined') {
+      document.documentElement.setAttribute('data-theme', initial);
+    }
+    return initial;
+  });
   const location = useLocation();
-  const navigate = useNavigate();
   const isHome = location.pathname === '/';
+  const isWorkspace = ['/user', '/patient', '/doctor', '/admin', '/login'].some((p) =>
+    location.pathname.startsWith(p)
+  );
 
   useEffect(() => {
-    const syncAuth = () => setSessionState(getSession());
-    window.addEventListener('gynaura-auth', syncAuth);
-    window.addEventListener('storage', syncAuth);
-    return () => {
-      window.removeEventListener('gynaura-auth', syncAuth);
-      window.removeEventListener('storage', syncAuth);
-    };
-  }, []);
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem('gynaura_theme', theme);
+  }, [theme]);
+
+  const toggleTheme = () => setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'));
 
   const closeMobile = () => setMobileOpen(false);
 
-  const handleLogout = () => {
-    apiPost('/auth/logout', {}).catch(() => {});
-    clearSession();
-    closeMobile();
-    navigate('/');
-  };
+  const themeLabel = theme === 'dark' ? '☀ Light' : '☾ Dark';
 
-  const isSignedIn = Boolean(session?.token);
-  const portalPath =
-    session?.role === 'admin'
-      ? '/admin'
-      : session?.role === 'doctor'
-        ? '/doctor'
-        : '/user';
-  const portalLabel =
-    session?.role === 'admin'
-      ? 'Admin Portal'
-      : session?.role === 'doctor'
-        ? 'Doctor Console'
-        : 'My Health Hub';
-  const roleBadgeLabel =
-    session?.role === 'admin'
-      ? 'Admin'
-      : session?.role === 'doctor'
-        ? 'Doctor'
-        : 'User';
+  if (isWorkspace) {
+    return null;
+  }
 
   return (
     <header className="nav fixed-nav">
@@ -58,50 +42,34 @@ export function TopBar() {
 
         {/* Center Navigation */}
         <div className="nav-center-cluster">
-          {!isSignedIn && isHome && (
-            <div className="desktop-nav">
+          {isHome && (
+            <nav className="desktop-nav" aria-label="Main website">
               <a href="#overview">Overview</a>
               <a href="#specialties">Specialties</a>
-              <a href="#for-doctors">For Doctors</a>
+              <a href="#how-it-works">How It Works</a>
               <a href="#book">Book Visit</a>
-            </div>
-          )}
-
-          {isSignedIn && (
-            <div className="desktop-nav">
-              <NavLink to={portalPath} className={({ isActive }) => (isActive ? 'on' : '')}>
-                {portalLabel}
-              </NavLink>
-            </div>
+            </nav>
           )}
         </div>
 
-        {/* Right Action Cluster */}
+        {/* Right Action Cluster — Pure Website Actions (No Login / Logout) */}
         <div className="navcta">
-          {isSignedIn ? (
-            <>
-              <Link to={portalPath} className="user-pill">
-                <span>{session.user?.name || (session.role === 'admin' ? 'Admin' : 'Account')}</span>
-                <span className="badge-plum">{roleBadgeLabel}</span>
-              </Link>
-              <button type="button" className="ws-btn" onClick={handleLogout}>
-                Logout
-              </button>
-            </>
-          ) : (
-            <>
-              <Link to="/login" className="ghost">
-                Sign In
-              </Link>
-              <Link to="/#book" className="btn sm">
-                Book Visit
-              </Link>
-            </>
-          )}
+          <button
+            type="button"
+            className="ws-btn"
+            onClick={toggleTheme}
+            aria-label="Toggle color theme"
+          >
+            {themeLabel}
+          </button>
+          <Link to="/user" className="btn sm">
+            Try the App
+          </Link>
           <button
             className="menu-btn"
             onClick={() => setMobileOpen(!mobileOpen)}
             aria-label="Toggle navigation menu"
+            aria-expanded={mobileOpen}
           >
             <Icon d={mobileOpen ? I.close : I.menu} size={18} />
           </button>
@@ -110,42 +78,30 @@ export function TopBar() {
 
       {/* Mobile Nav Dropdown */}
       {mobileOpen && (
-        <div className="mobile-nav">
-          {isSignedIn ? (
+        <nav className="mobile-nav" aria-label="Mobile website">
+          <NavLink to="/" end className={({ isActive }) => (isActive ? 'on' : '')} onClick={closeMobile}>
+            Home
+          </NavLink>
+          {isHome && (
             <>
-              <NavLink
-                to={portalPath}
-                className={({ isActive }) => (isActive ? 'on' : '')}
-                onClick={closeMobile}
-              >
-                {portalLabel}
-              </NavLink>
-              <button type="button" className="ws-btn mobile-btn-cta" onClick={handleLogout}>
-                Logout
-              </button>
-            </>
-          ) : (
-            <>
-              <NavLink to="/" end className={({ isActive }) => (isActive ? 'on' : '')} onClick={closeMobile}>
-                Home
-              </NavLink>
-              {isHome && (
-                <>
-                  <a href="#overview" onClick={closeMobile}>Overview</a>
-                  <a href="#specialties" onClick={closeMobile}>Specialties</a>
-                  <a href="#for-doctors" onClick={closeMobile}>For Doctors</a>
-                  <a href="#book" onClick={closeMobile}>Book Visit</a>
-                </>
-              )}
-              <Link to="/login" onClick={closeMobile}>
-                Sign In
-              </Link>
-              <Link to="/#book" className="btn sm mobile-btn-cta" onClick={closeMobile}>
-                Book Visit
-              </Link>
+              <a href="#overview" onClick={closeMobile}>Overview</a>
+              <a href="#specialties" onClick={closeMobile}>Specialties</a>
+              <a href="#how-it-works" onClick={closeMobile}>How It Works</a>
+              <a href="#book" onClick={closeMobile}>Book Visit</a>
             </>
           )}
-        </div>
+          <Link to="/user" className="btn sm mobile-btn-cta" onClick={closeMobile}>
+            Try the App
+          </Link>
+          <button
+            type="button"
+            className="ws-btn mobile-btn-cta"
+            onClick={toggleTheme}
+            aria-label="Toggle color theme"
+          >
+            {themeLabel}
+          </button>
+        </nav>
       )}
     </header>
   );
